@@ -2,4 +2,4 @@
 set -o errexit
 
 npm install
-npx puppeteer browsers install chrome
+PUPPETEER_CACHE_DIR=/opt/render/project/src/.cache/puppeteer npx puppeteer browsers install chrome
