@@ -1,17 +1,37 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers } = require('baileys');
 const { Boom } = require('@hapi/boom');
 const pino = require('pino');
-const qrcode = require('qrcode-terminal');
 const express = require('express');
 const { GoogleGenAI } = require('@google/genai');
 const { createClient } = require('@supabase/supabase-js');
 require('dotenv').config();
 
-// 1. Dummy Web Server to satisfy Render's open port requirement
+// 1. Express Server (Serves Live QR + Keeps Render Port Open)
 const app = express();
 const PORT = process.env.PORT || 8000;
-app.get('/', (req, res) => res.send('🚀 Drake WhatsApp Bot is Online!'));
-app.listen(PORT, '0.0.0.0', () => console.log(`🌐 Health server listening on port ${PORT}`));
+let latestQR = "";
+let isConnected = false;
+
+app.get('/', (req, res) => {
+    if (isConnected) {
+        return res.send('<h2>🚀 Drake WhatsApp Bot is Online & Connected!</h2>');
+    }
+    if (!latestQR) {
+        return res.send('<h2>⏳ Generating QR code... Refresh in 3 seconds.</h2><script>setTimeout(()=>location.reload(), 3000)</script>');
+    }
+    // Renders a clean, real-time scannable QR image using Google/QRServer API
+    const qrImgUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(latestQR)}`;
+    res.send(`
+        <div style="font-family:sans-serif;text-align:center;margin-top:50px;">
+            <h2>📱 Scan with WhatsApp (Linked Devices)</h2>
+            <img src="${qrImgUrl}" style="border:10px solid #fff;box-shadow:0 0 15px rgba(0,0,0,0.2);" />
+            <p>Page auto-refreshes every 15 seconds so the token never expires.</p>
+            <script>setTimeout(()=>location.reload(), 15000)</script>
+        </div>
+    `);
+});
+
+app.listen(PORT, '0.0.0.0', () => console.log(`🌐 Server listening on port ${PORT}`));
 
 // 2. Initialize Gemini & Supabase
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
@@ -57,7 +77,8 @@ async function startDrake() {
     const sock = makeWASocket({
         auth: state,
         logger: pino({ level: 'silent' }),
-        printQRInTerminal: false // We handle QR printing cleanly below
+        browser: Browsers.ubuntu('Chrome'), // Prevents WhatsApp 401 rejection on cloud servers
+        printQRInTerminal: false
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -65,18 +86,23 @@ async function startDrake() {
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
 
-     if (qr) {
-            console.log('📱 PASTE THIS EXACT STRING INTO ANY ONLINE QR GENERATOR:');
-            console.log(qr);
+        if (qr) {
+            latestQR = qr;
+            isConnected = false;
+            console.log('📱 New QR generated! Open your Render URL in a browser to scan it live.');
         }
 
         if (connection === 'close') {
-            const shouldReconnect = (lastDisconnect?.error instanceof Boom)
-                ? lastDisconnect.error.output.statusCode !== DisconnectReason.loggedOut
-                : true;
-            console.log('⚠️ Connection closed. Reconnecting:', shouldReconnect);
+            isConnected = false;
+            const statusCode = (lastDisconnect?.error instanceof Boom)
+                ? lastDisconnect.error.output.statusCode
+                : 0;
+            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+            console.log(`⚠️ Connection closed (Code: ${statusCode}). Reconnecting:`, shouldReconnect);
             if (shouldReconnect) startDrake();
         } else if (connection === 'open') {
+            latestQR = "";
+            isConnected = true;
             console.log('🚀 Drake Supabase-Backed WhatsApp Bot is online and connected!');
         }
     });
