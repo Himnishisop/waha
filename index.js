@@ -49,7 +49,6 @@ async function saveMemoryData(jsonPayload) {
 const client = new Client({
     authStrategy: new LocalAuth(),
     puppeteer: {
-        executablePath: '/usr/bin/google-chrome-stable', // Points to Linux Chrome inside Docker
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
