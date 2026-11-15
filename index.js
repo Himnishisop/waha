@@ -65,9 +65,9 @@ async function startDrake() {
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
 
-        if (qr) {
-            console.log('📱 Scan this QR code with your WhatsApp:');
-            qrcode.generate(qr, { small: true });
+     if (qr) {
+            console.log('📱 PASTE THIS EXACT STRING INTO ANY ONLINE QR GENERATOR:');
+            console.log(qr);
         }
 
         if (connection === 'close') {
