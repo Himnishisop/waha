@@ -49,7 +49,7 @@ async function saveMemoryData(jsonPayload) {
 const client = new Client({
     authStrategy: new LocalAuth(),
     puppeteer: {
-        // Essential flags so Chromium runs smoothly inside lightweight cloud containers without crashing
+        executablePath: '/usr/bin/google-chrome-stable', // Points to Linux Chrome inside Docker
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
