@@ -14,7 +14,7 @@ let isConnected = false;
 
 app.get('/', (req, res) => {
     if (isConnected) {
-        return res.send('<h2>🚀 Drake BOMBEAT WhatsApp Bot is Online & Connected to Supabase!</h2>');
+        return res.send('<h2>🚀 Drake Unified Bot is Online & Connected to Supabase!</h2>');
     }
     if (!latestQR) {
         return res.send('<h2>⏳ Generating QR code... Refresh in 3 seconds.</h2><script>setTimeout(()=>location.reload(), 3000)</script>');
@@ -37,7 +37,38 @@ const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
 const OWNER_PHONE = '9372486797';
 
-// --- DATABASE HELPERS (Business Instructions Table) ---
+// Track mode per user/owner session (Default: Personal mode)
+const ownerModes = new Map(); // phone -> 'personal' | 'business'
+
+// --- DATABASE HELPERS ---
+async function getPersonalMemory() {
+    try {
+        const { data, error } = await supabase
+            .from('drake_memory')
+            .select('data')
+            .eq('id', 'main')
+            .single();
+
+        if (error || !data) {
+            return { owner_name: "Himnish", bio: "Tech builder, musician, founder of Bombeat Artists.", core_memories: [] };
+        }
+        return data.data;
+    } catch (e) {
+        return { owner_name: "Himnish", bio: "Tech builder, musician, founder of Bombeat Artists.", core_memories: [] };
+    }
+}
+
+async function savePersonalMemory(jsonPayload) {
+    try {
+        await supabase
+            .from('drake_memory')
+            .upsert({ id: 'main', data: jsonPayload });
+        console.log("💾 [SUCCESS] drake_memory updated in Supabase!");
+    } catch (e) {
+        console.error("Error saving drake_memory:", e.message);
+    }
+}
+
 async function getBusinessMemory() {
     try {
         const { data, error } = await supabase
@@ -51,24 +82,21 @@ async function getBusinessMemory() {
         }
         return data.data;
     } catch (e) {
-        console.error("Error fetching business_instructions:", e.message);
         return { business_name: "BOMBEAT", location: "Mumbai (Naigaon)", owner_instructions: [] };
     }
 }
 
 async function saveBusinessMemory(jsonPayload) {
     try {
-        const { error } = await supabase
+        await supabase
             .from('business_instructions')
             .upsert({ id: 'main', data: jsonPayload });
-        if (error) console.error("Error saving business_instructions:", error.message);
-        else console.log("💾 [SUCCESS] business_instructions updated in Supabase!");
+        console.log("💾 [SUCCESS] business_instructions updated in Supabase!");
     } catch (e) {
-        console.error("Exception saving business_instructions:", e.message);
+        console.error("Error saving business_instructions:", e.message);
     }
 }
 
-// --- DATABASE HELPERS (WhatsApp Memory Table) ---
 async function getChatHistory(phone) {
     try {
         const { data, error } = await supabase
@@ -123,7 +151,7 @@ async function startDrake() {
         } else if (connection === 'open') {
             latestQR = "";
             isConnected = true;
-            console.log('🚀 Drake BOMBEAT WhatsApp Bot is online and connected!');
+            console.log('🚀 Drake Unified Bot is online and connected!');
         }
     });
 
@@ -145,60 +173,89 @@ async function startDrake() {
 
             console.log(`📩 Incoming | Name: ${senderName} | Phone: ${senderPhone} | Msg: ${messageText}`);
 
-            let businessMemory = await getBusinessMemory();
-            if (!businessMemory.owner_instructions) businessMemory.owner_instructions = [];
-
             const isOwner = (
                 senderPhone.includes(OWNER_PHONE) ||
-                senderName.toLowerCase().includes('himnish') ||
-                messageText.trim().startsWith('!train')
+                senderName.toLowerCase().includes('himnish')
             );
 
-            // ==================== OWNER TRAINING MODE ====================
-            if (isOwner) {
-                let instruction = messageText.trim();
-                if (instruction.startsWith('!train')) {
-                    instruction = instruction.replace('!train', '').trim();
-                }
-
-                console.log("👑 OWNER TRAINING MODE TRIGGERED! Saving to business_instructions...");
-                businessMemory.owner_instructions.push(instruction);
-                await saveBusinessMemory(businessMemory);
-
-                const ownerPrompt = `
-                You are Drake, Himnish's personal AI assistant and the business brain behind BOMBEAT. 
-                Himnish (your owner) just trained you with this business rule: "${instruction}"
-                Acknowledge him concisely, confirm it's saved permanently to Supabase (table 'business_instructions'), and state the total rule count (${businessMemory.owner_instructions.length}).
-                `;
-
-                try {
-                    const response = await ai.models.generateContent({
-                        model: 'gemini-3.5-flash-lite',
-                        contents: ownerPrompt,
-                    });
-                    await sock.sendMessage(remoteJid, { text: response.text.trim() }, { quoted: msg });
-                } catch (e) {
-                    await sock.sendMessage(remoteJid, { text: `Boss, saved to business_instructions! (${businessMemory.owner_instructions.length} rules total)` }, { quoted: msg });
-                }
-                continue;
+            // Initialize mode state for owner if not set
+            if (isOwner && !ownerModes.has(senderPhone)) {
+                ownerModes.set(senderPhone, 'personal');
             }
 
-            // ==================== CUSTOMER CHAT & MEMORY EXTRACTION ====================
+            // ==================== OWNER COMMANDS (MODE SWITCHING) ====================
+            if (isOwner) {
+                const lowerMsg = messageText.trim().toLowerCase();
+
+                if (lowerMsg.includes('activate business mode')) {
+                    ownerModes.set(senderPhone, 'business');
+                    await sock.sendMessage(remoteJid, { text: "💼 Business Mode Activated. I am now in learning/booking mode for Bombeat. Send instructions or let me handle clients while still sharing my opinions!" }, { quoted: msg });
+                    continue;
+                }
+
+                if (lowerMsg.includes('deactivate business mode')) {
+                    ownerModes.set(senderPhone, 'personal');
+                    await sock.sendMessage(remoteJid, { text: "👤 Personal Mode Activated. Back to being your personal Drake, sharing thoughts and tech/music insights." }, { quoted: msg });
+                    continue;
+                }
+            }
+
+            // Load Memories
+            let personalMemory = await getPersonalMemory();
+            let businessMemory = getBusinessMemory(); // can await below
+
+            // ==================== OWNER CHAT (PERSONAL VS BUSINESS MODE) ====================
+            if (isOwner) {
+                const currentMode = ownerModes.get(senderPhone) || 'press_personal';
+                businessMemory = await businessMemory;
+
+                if (currentMode === 'business') {
+                    // Training / Learning in Business Mode
+                    let instruction = messageText.trim();
+                    if (instruction.startsWith('!train')) {
+                        instruction = instruction.replace('!train', '').trim();
+                    }
+                    if (!businessMemory.owner_instructions) businessMemory.owner_instructions = [];
+                    businessMemory.owner_instructions.push(instruction);
+                    await saveBusinessMemory(businessMemory);
+
+                    await sock.sendMessage(remoteJid, { text: `👑 [Business Mode] Learned & saved to business_instructions! (${businessMemory.owner_instructions.length} rules total)` }, { quoted: msg });
+                    continue;
+                } else {
+                    // Personal Mode with Owner: Share opinions, leverage drake_memory
+                    const personalContext = JSON.stringify(personalMemory);
+                    const prompt = `You are Drake, Himnish's personal AI assistant. You share your unfiltered opinions, technical insights, and personal banter. 
+                    Here is your core memory table (drake_memory): ${personalContext}
+                    
+                    Himnish says: "${messageText}"`;
+
+                    try {
+                        const response = await ai.models.generateContent({
+                            model: 'gemini-3.5-flash-lite',
+                            contents: prompt,
+                        });
+                        await sock.sendMessage(remoteJid, { text: response.text.trim() }, { quoted: msg });
+                    } catch (e) {
+                        await sock.sendMessage(remoteJid, { text: "Boss, minor hiccup in personal mode." }, { quoted: msg });
+                    }
+                    continue;
+                }
+            }
+
+            // ==================== REGULAR CLIENT CHAT (BOMBEAT BUSINESS MODE) ====================
+            businessMemory = await businessMemory;
             let userHistory = await getChatHistory(senderPhone);
-            const learnedGuidelines = businessMemory.owner_instructions.map(rule => `- ${rule}`).join('\n');
+            const learnedGuidelines = (businessMemory.owner_instructions || []).map(rule => `- ${rule}`).join('\n');
+            const personalContext = JSON.stringify(personalMemory);
 
             const SYSTEM_PROMPT = `
             You are Drake, the AI assistant for BOMBEAT, a live music entertainment and event coordination business based in Mumbai (Naigaon).
-            Your job is to handle customer inquiries on WhatsApp professionally, pitch performers, and close bookings based *strictly* on the rules and pricing Himnish has taught you below.
-
-            BUSINESS IDENTITY:
-            - Business Name: BOMBEAT
-            - Location: Mumbai (Naigaon)
+            You have a personal identity rooted in Himnish's world (shared via drake_memory: ${personalContext}), meaning you can occasionally express natural opinions while remaining professional, helpful, and focused on booking music shows.
 
             BUSINESS INSTRUCTIONS & POLICIES:
             ${learnedGuidelines || "No specific business instructions taught yet."}
 
-            Tone: Friendly, helpful, and natural. Adhere strictly to Himnish's directives above.
+            Tone: Sharp, professional yet conversational and opinionated when appropriate.
             `;
 
             const transcript = userHistory.slice(-6).map(m => `${m.role}: ${m.content}`).join('\n');
@@ -216,25 +273,10 @@ async function startDrake() {
                 userHistory.push({ role: 'assistant', content: replyText, timestamp: new Date().toISOString() });
                 await saveChatHistory(senderPhone, userHistory);
 
-                // Auto-learn business feedback if customer talks about pricing or booking terms
-                if (messageText.toLowerCase().includes("budget") || messageText.toLowerCase().includes("price") || messageText.toLowerCase().includes("book")) {
-                    try {
-                        const reflectionPrompt = `Analyze this customer interaction and extract any implicit business lesson or pricing feedback learned: "Client: ${messageText} | Bot: ${replyText}". If a clear rule was demonstrated, state it in 1 short sentence. If none, reply "NONE".`;
-                        const refRes = await ai.models.generateContent({ model: 'gemini-3.5-flash-lite', contents: reflectionPrompt });
-                        const lesson = refRes.text.trim();
-                        if (lesson && lesson !== "NONE" && !businessMemory.owner_instructions.includes(lesson)) {
-                            businessMemory.owner_instructions.push(`Auto-learned from chat (${senderPhone}): ${lesson}`);
-                            await saveBusinessMemory(businessMemory);
-                        }
-                    } catch (err) {
-                        // Silent catch for background reflection
-                    }
-                }
-
                 await sock.sendMessage(remoteJid, { text: replyText }, { quoted: msg });
             } catch (e) {
                 console.error("Gemini Error:", e);
-                await sock.sendMessage(remoteJid, { text: "Sorry, I'm having a brief technical hiccup. I'll get back to you shortly!" }, { quoted: msg });
+                await sock.sendMessage(remoteJid, { text: "Sorry, having a brief technical hiccup. I'll get back to you shortly!" }, { quoted: msg });
             }
         }
     });
