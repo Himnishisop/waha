@@ -68,6 +68,25 @@ async function savePersonalMemory(jsonPayload) {
         console.error("Error saving drake_memory:", e.message);
     }
 }
+async function saveChatHistory(phone, history) {
+    try {
+        const { error } = await supabase
+            .from('whatsapp_memory') // Make sure this matches your table name exactly
+            .upsert({ 
+                phone_number: phone, 
+                chat_history: history,
+                updated_at: new Date().toISOString()
+            });
+        
+        if (error) {
+            console.error("❌ SUPABASE WRITE ERROR (whatsapp_memory):", error.message);
+        } else {
+            console.log(`💾 [SUCCESS] Chat history saved for ${phone}`);
+        }
+    } catch (e) {
+        console.error("Exception saving WhatsApp_memory:", e.message);
+    }
+}
 
 async function getBusinessMemory() {
     try {
