@@ -70,21 +70,22 @@ async function savePersonalMemory(jsonPayload) {
 }
 async function saveChatHistory(phone, history) {
     try {
-        const { error } = await supabase
-            .from('whatsapp_memory') // Make sure this matches your table name exactly
+        const { data, error } = await supabase
+            .from('whatsapp_memory')
             .upsert({ 
-                phone_number: phone, 
+                phone_number: String(phone), 
                 chat_history: history,
                 updated_at: new Date().toISOString()
-            });
-        
+            }, { onConflict: 'phone_number' })
+            .select();
+
         if (error) {
-            console.error("❌ SUPABASE WRITE ERROR (whatsapp_memory):", error.message);
+            console.error("❌ SUPABASE UPSERT FAILED:", error.message, error.details);
         } else {
-            console.log(`💾 [SUCCESS] Chat history saved for ${phone}`);
+            console.log(`💾 [SUCCESS] Database updated for phone: ${phone}`);
         }
     } catch (e) {
-        console.error("Exception saving WhatsApp_memory:", e.message);
+        console.error("Exception in saveChatHistory:", e.message);
     }
 }
 
