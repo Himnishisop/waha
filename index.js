@@ -35,10 +35,12 @@ app.listen(PORT, '0.0.0.0', () => console.log(`🌐 Server listening on port ${P
 // 2. Initialize Gemini & Supabase
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
-const OWNER_PHONE = '9372486797';
 
-// Track mode per owner session & prevent self-chat infinite loops
-const ownerModes = new Map(); // phone -> 'personal' | 'business'
+const OWNER_PHONE = '9372486797';
+const OWNER_JID = `91${OWNER_PHONE}@s.whatsapp.net`;
+
+// Global mode for owner so @lid vs phone JID mismatches never reset your mode
+let currentOwnerMode = 'personal'; // 'personal' | 'business'
 const botSentIds = new Set();
 
 // --- DATABASE HELPERS ---
@@ -53,7 +55,7 @@ async function getPersonalMemory() {
         if (error || !data) {
             return { owner_name: "Himnish", core_memories: [] };
         }
-        return data.data;
+        return data.data || { owner_name: "Himnish", core_memories: [] };
     } catch (e) {
         return { owner_name: "Himnish", core_memories: [] };
     }
@@ -63,8 +65,8 @@ async function savePersonalMemory(jsonPayload) {
     try {
         const { error } = await supabase
             .from('drake_memory')
-            .upsert({ id: 'main', data: jsonPayload });
-        if (error) console.error("❌ Error saving drake_memory:", error.message);
+            .upsert({ id: 'main', data: jsonPayload }, { onConflict: 'id' });
+        if (error) console.error("❌ Error saving drake_memory:", error.message, error.details);
         else console.log("💾 [SUCCESS] drake_memory updated in Supabase!");
     } catch (e) {
         console.error("Exception saving drake_memory:", e.message);
@@ -82,7 +84,7 @@ async function getBusinessMemory() {
         if (error || !data) {
             return { business_name: "BOMBEAT", location: "Mumbai (Naigaon)", owner_instructions: [] };
         }
-        return data.data;
+        return data.data || { business_name: "BOMBEAT", location: "Mumbai (Naigaon)", owner_instructions: [] };
     } catch (e) {
         return { business_name: "BOMBEAT", location: "Mumbai (Naigaon)", owner_instructions: [] };
     }
@@ -92,11 +94,16 @@ async function saveBusinessMemory(jsonPayload) {
     try {
         const { error } = await supabase
             .from('business_instructions')
-            .upsert({ id: 'main', data: jsonPayload });
-        if (error) console.error("❌ Error saving business_instructions:", error.message);
-        else console.log("💾 [SUCCESS] business_instructions updated in Supabase!");
+            .upsert({ id: 'main', data: jsonPayload }, { onConflict: 'id' });
+        if (error) {
+            console.error("❌ SUPABASE WRITE ERROR (business_instructions):", error.message, error.details);
+            return false;
+        }
+        console.log("💾 [SUCCESS] business_instructions updated in Supabase!");
+        return true;
     } catch (e) {
         console.error("Exception saving business_instructions:", e.message);
+        return false;
     }
 }
 
@@ -211,34 +218,42 @@ async function startDrake() {
 
             if (!messageText) continue;
 
-            console.log(`📩 Incoming | Name: ${senderName} | Phone: ${senderPhone} | Msg: ${messageText}`);
+            console.log(`📩 Incoming | Name: ${senderName} | Phone: ${senderPhone} | Mode: ${currentOwnerMode} | Msg: ${messageText}`);
 
             const reply = async (text) => {
                 const sent = await sock.sendMessage(remoteJid, { text }, { quoted: msg });
                 if (sent?.key?.id) botSentIds.add(sent.key.id);
             };
 
+            const notifyOwner = async (alertText) => {
+                try {
+                    const targetJid = sock.user?.id ? sock.user.id.replace(/:\d+@/, '@') : OWNER_JID;
+                    const sent = await sock.sendMessage(targetJid, { text: alertText });
+                    if (sent?.key?.id) botSentIds.add(sent.key.id);
+                    console.log("🚨 Escalation alert sent to owner!");
+                } catch (err) {
+                    console.error("❌ Failed to send escalation alert to owner:", err.message);
+                }
+            };
+
             const isOwner = (
+                isSelfChat ||
                 senderPhone.includes(OWNER_PHONE) ||
                 senderName.toLowerCase().includes('himnish')
             );
-
-            if (isOwner && !ownerModes.has(senderPhone)) {
-                ownerModes.set(senderPhone, 'personal');
-            }
 
             // ==================== OWNER COMMANDS (MODE SWITCHING) ====================
             if (isOwner) {
                 const lowerMsg = messageText.trim().toLowerCase();
 
                 if (lowerMsg.includes('activate business mode')) {
-                    ownerModes.set(senderPhone, 'business');
-                    await reply("💼 Business Mode Activated. Drop new rules, pricing, or workflows and I'll lock them into `business_instructions`.");
+                    currentOwnerMode = 'business';
+                    await reply("💼 Business Mode Activated. Drop any rules, pricing, or escalation triggers (e.g., 'ask me if someone wants a 3-piece band on a weekend') and I'll lock them into `business_instructions`.");
                     continue;
                 }
 
                 if (lowerMsg.includes('deactivate business mode')) {
-                    ownerModes.set(senderPhone, 'personal');
+                    currentOwnerMode = 'personal';
                     await reply("👤 Personal Mode Activated. Ask me for today's chat audit, lead breakdown, or drop things for me to remember.");
                     continue;
                 }
@@ -251,14 +266,19 @@ async function startDrake() {
 
             // ==================== OWNER CHAT (PERSONAL / ANALYST / BUSINESS) ====================
             if (isOwner) {
-                const currentMode = ownerModes.get(senderPhone) || 'personal';
-
-                if (currentMode === 'business') {
+                if (currentOwnerMode === 'business') {
                     let instruction = messageText.trim();
                     if (instruction.startsWith('!train')) instruction = instruction.replace('!train', '').trim();
-                    if (!businessMemory.owner_instructions) businessMemory.owner_instructions = [];
+                    if (!Array.isArray(businessMemory.owner_instructions)) {
+                        businessMemory.owner_instructions = [];
+                    }
                     businessMemory.owner_instructions.push(instruction);
-                    await saveBusinessMemory(businessMemory);
+                    const saved = await saveBusinessMemory(businessMemory);
+
+                    if (!saved) {
+                        await reply("⚠️ Tried saving to `business_instructions`, but Supabase returned an error. Check Render logs!");
+                        continue;
+                    }
 
                     const bizPrompt = `You are Drake, Himnish's co-founder/AI brain for BOMBEAT. Himnish just added this business rule: "${instruction}". 
                     Confirm it's saved to 'business_instructions' (${businessMemory.owner_instructions.length} total) and give a quick, honest, sharp opinion on whether this rule helps close Mumbai live music clients or if there's any catch.`;
@@ -275,7 +295,7 @@ async function startDrake() {
                     const lowerMsg = messageText.toLowerCase();
 
                     if (lowerMsg.includes('remember') || lowerMsg.includes('note this') || lowerMsg.includes('save this')) {
-                        if (!personalMemory.core_memories) personalMemory.core_memories = [];
+                        if (!Array.isArray(personalMemory.core_memories)) personalMemory.core_memories = [];
                         personalMemory.core_memories.push({
                             memory: messageText,
                             timestamp: new Date().toISOString()
@@ -334,7 +354,7 @@ async function startDrake() {
                 }
             }
 
-            // ==================== REGULAR CLIENT CHAT (BOMBEAT) ====================
+            // ==================== REGULAR CLIENT CHAT (BOMBEAT + SMART ESCALATION) ====================
             const learnedGuidelines = (businessMemory.owner_instructions || []).map(rule => `- ${rule}`).join('\n');
             const personalContext = JSON.stringify(personalMemory);
 
@@ -346,24 +366,61 @@ async function startDrake() {
             BUSINESS INSTRUCTIONS & POLICIES:
             ${learnedGuidelines || "No specific business instructions taught yet."}
 
-            Tone: Sharp, professional, helpful, and natural. Keep track of what the client said previously in the chat history.
+            SMART ESCALATION LOGIC:
+            Evaluate the client's message carefully against the BUSINESS INSTRUCTIONS & POLICIES above.
+            If ANY of the following are true:
+            1. The client's message triggers an instruction where Himnish told you to message/ask him (e.g., checking availability for a specific date/artist, custom pricing, special requests).
+            2. You are genuinely uncertain/dicey about whether BOMBEAT can fulfill the client's request (specific date availability, artist lineup availability, custom discount, out-of-area venue, or missing policy info).
+            
+            Then set "escalate_to_owner": true, write a natural holding reply in "reply_to_client" (e.g., telling the client you're checking availability/details with the team and will confirm shortly), and write a clear, actionable question for Himnish in "owner_alert".
+            Otherwise, set "escalate_to_owner": false and "owner_alert": "".
+
+            OUTPUT FORMAT:
+            Respond ONLY with valid raw JSON (no markdown code blocks, no extra text):
+            {
+              "reply_to_client": "Your message to send back to the client",
+              "escalate_to_owner": true or false,
+              "owner_alert": "Direct message to Himnish asking for confirmation if escalate_to_owner is true, otherwise empty string"
+            }
             `;
 
             const transcript = userHistory.slice(-15).map(m => `[${m.timestamp}] ${m.role} (${m.sender || senderName}): ${m.content}`).join('\n');
-            const prompt = `${SYSTEM_PROMPT}\n\nClient Name: ${senderName} (Phone: ${senderPhone})\nFull Chat History:\n${transcript}\nuser: ${messageText}\nassistant:`;
+            const prompt = `${SYSTEM_PROMPT}\n\nClient Name: ${senderName} (Phone: ${senderPhone})\nFull Chat History:\n${transcript}\nuser: ${messageText}\nJSON:`;
 
             try {
                 const response = await ai.models.generateContent({
                     model: 'gemini-3.5-flash-lite',
                     contents: prompt,
                 });
-                const replyText = response.text.trim();
+
+                let rawText = response.text.trim();
+                // Strip accidental markdown fences if Gemini includes them
+                rawText = rawText.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
+
+                let replyText = "";
+                let shouldEscalate = false;
+                let ownerAlert = "";
+
+                try {
+                    const parsed = JSON.parse(rawText);
+                    replyText = parsed.reply_to_client || rawText;
+                    shouldEscalate = Boolean(parsed.escalate_to_owner);
+                    ownerAlert = parsed.owner_alert || "";
+                } catch (parseErr) {
+                    // Fallback if model returns plain text
+                    replyText = rawText;
+                }
 
                 userHistory.push({ role: 'user', sender: senderName, phone: senderPhone, content: messageText, timestamp: new Date().toISOString() });
                 userHistory.push({ role: 'assistant', sender: 'Drake', content: replyText, timestamp: new Date().toISOString() });
                 await saveChatHistory(senderPhone, senderName, userHistory);
 
                 await reply(replyText);
+
+                if (shouldEscalate && ownerAlert) {
+                    const formattedAlert = `🚨 *BOMBEAT Escalation Alert*\n*Client:* ${senderName} (${senderPhone})\n*Client Said:* "${messageText}"\n\n*Drake's Question:* ${ownerAlert}`;
+                    await notifyOwner(formattedAlert);
+                }
             } catch (e) {
                 console.error("Gemini Error:", e);
                 await reply("Sorry, having a brief technical hiccup. I'll get back to you shortly!");
