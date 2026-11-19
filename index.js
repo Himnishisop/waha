@@ -264,7 +264,7 @@ async function startDrake() {
                     Confirm it's saved to 'business_instructions' (${businessMemory.owner_instructions.length} total) and give a quick, honest, sharp opinion on whether this rule helps close Mumbai live music clients or if there's any catch.`;
 
                     try {
-                        const res = await ai.models.generateContent({ model: 'gemini-2.5-flash', contents: bizPrompt });
+                        const res = await ai.models.generateContent({ model: 'gemini-3.5-flash-lite', contents: bizPrompt });
                         await reply(res.text.trim());
                     } catch (e) {
                         await reply(`👑 [Business] Saved rule! (${businessMemory.owner_instructions.length} total)`);
@@ -319,7 +319,7 @@ async function startDrake() {
                         Drake:`;
 
                         const response = await ai.models.generateContent({
-                            model: 'gemini-2.5-flash',
+                            model: 'gemini-3.5-flash-lite',
                             contents: analystPrompt,
                         });
                         replyText = response.text.trim();
