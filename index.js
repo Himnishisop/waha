@@ -41,6 +41,7 @@ const OWNER_JID = `91${OWNER_PHONE}@s.whatsapp.net`;
 
 let currentOwnerMode = 'personal'; // 'personal' | 'business'
 const botSentIds = new Set();
+const turnCounters = new Map();
 
 function extractText(m) {
     if (!m) return "";
@@ -51,6 +52,13 @@ function extractText(m) {
         || m.viewOnceMessage?.message?.conversation
         || m.viewOnceMessage?.message?.extendedTextMessage?.text
         || "";
+}
+
+async function withTimeout(promise, ms = 7000) {
+    return Promise.race([
+        promise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), ms))
+    ]);
 }
 
 // --- DATABASE HELPERS ---
@@ -145,14 +153,13 @@ async function getNumberRecord(phone) {
     }
 }
 
-// Save ONLY this number's latest 10 messages + updated overall_info
+// Save ONLY this number's latest 10 messages + distilled overall_info
 async function saveNumberRecord(phone, senderName, history, overallInfo) {
     const trimmedHistory = Array.isArray(history) ? history.slice(-10) : [];
     const safeOverall = typeof overallInfo === "string" ? overallInfo : "";
-    console.log(`📝 Attempting upsert into chats_history for ${phone} (${trimmedHistory.length} msgs)...`);
 
     try {
-        const { data, error } = await supabase
+        const { error } = await supabase
             .from('chats_history')
             .upsert({
                 phone_number: String(phone),
@@ -160,13 +167,12 @@ async function saveNumberRecord(phone, senderName, history, overallInfo) {
                 chat_history: trimmedHistory,
                 overall_info: safeOverall,
                 updated_at: new Date().toISOString()
-            }, { onConflict: 'phone_number' })
-            .select('phone_number');
+            }, { onConflict: 'phone_number' });
 
         if (error) {
-            console.error("❌ SUPABASE WRITE ERROR (chats_history):", error.message, error.details || "", error.hint || "");
+            console.error("❌ SUPABASE WRITE ERROR (chats_history):", error.message, error.details || "");
         } else {
-            console.log(`💾 [SUCCESS] Row written in chats_history:`, data);
+            console.log(`💾 [SUCCESS] Saved ${trimmedHistory.length} msgs & learned overall_info for ${senderName} (${phone})`);
         }
     } catch (e) {
         console.error("❌ Exception saving chats_history:", e.message);
@@ -187,19 +193,54 @@ async function getAllChatsForAnalysis() {
     }
 }
 
-function buildUpdatedOverallInfo(existingInfo, senderName, userMsg, botReply, isOwnerChat) {
-    const stamp = new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
-    const entry = isOwnerChat
-        ? `[${stamp}] Himnish: ${userMsg} | Drake: ${botReply}`
-        : `[${stamp}] ${senderName}: ${userMsg} -> Drake: ${botReply}`;
+// Extracts ONLY distilled takeaways/learnings into overall_info (never raw chat transcripts)
+async function refreshLearnedOverallInfo(phoneKey, existingInfo, senderName, isOwnerChat, latestUserMsg, latestBotReply, history, forceUpdate = false) {
+    const key = String(phoneKey);
+    const count = (turnCounters.get(key) || 0) + 1;
+    turnCounters.set(key, count);
 
-    const lines = (existingInfo || "")
-        .split("\n")
-        .map(l => l.trim())
-        .filter(Boolean);
+    // Update on turn 1, every 3rd turn, or when forced (e.g. "remember" / business rule) so responses stay fast
+    if (!forceUpdate && count !== 1 && count % 3 !== 0) {
+        return existingInfo || "";
+    }
 
-    lines.push(entry);
-    return lines.slice(-12).join("\n");
+    const recentSlice = (Array.isArray(history) ? history.slice(-6) : [])
+        .map(m => `${m.role}: ${m.content}`)
+        .join("\n");
+
+    const prompt = `
+Extract ONLY distilled takeaways and learned facts from this conversation (NO raw chat logs, NO "User said / Bot replied" transcripts).
+
+Contact: ${senderName} (${isOwnerChat ? "Owner" : "Client/Lead"})
+Previous learned summary:
+${existingInfo || "None yet."}
+
+Recent turns:
+${recentSlice}
+Latest user message: "${latestUserMsg}"
+Latest assistant reply: "${latestBotReply}"
+
+Rules:
+- If Client: list what they want (e.g., solo singer, 2-piece band, DJ), budget (e.g., 10k), event date/venue/type, lead seriousness, and any key detail learned.
+- If Owner: list key focus areas, preferences, decisions, or things learned—keep it short and factual.
+- Merge with previous learned summary without duplicating old points. Keep it under 6 short bullet points.
+- Output ONLY the bullet points.
+`;
+
+    try {
+        const res = await withTimeout(
+            ai.models.generateContent({
+                model: 'gemini-3.5-flash-lite',
+                contents: prompt
+            }),
+            7000
+        );
+        const learned = (res.text || "").trim();
+        return learned || (existingInfo || "");
+    } catch (e) {
+        console.error("⚠️ Could not refresh learned overall_info:", e.message);
+        return existingInfo || "";
+    }
 }
 
 function isAnalysisRequest(text) {
@@ -257,7 +298,6 @@ async function startDrake() {
 
     // --- MESSAGE HANDLING LOOP ---
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
-        console.log(`🔔 messages.upsert fired | type=${type} | count=${messages.length}`);
         if (type !== 'notify') return;
 
         for (const msg of messages) {
@@ -272,21 +312,15 @@ async function startDrake() {
             if (remoteJid.includes('status@broadcast') || remoteJid.includes('@g.us')) continue;
 
             const isSelfChat = Boolean(msg.key.fromMe) && (remoteJid.includes(OWNER_PHONE) || remoteJid.includes('@lid'));
-            if (msg.key.fromMe && !isSelfChat) {
-                console.log(`⏭️ Skipping outgoing fromMe message to ${remoteJid}`);
-                continue;
-            }
+            if (msg.key.fromMe && !isSelfChat) continue;
 
             const senderPhone = isSelfChat ? OWNER_PHONE : remoteJid.split('@')[0];
             const senderName = isSelfChat ? "Himnish" : (msg.pushName || "Client");
             const messageText = extractText(msg.message);
 
-            if (!messageText) {
-                console.log(`⏭️ No text extracted from ${remoteJid}`);
-                continue;
-            }
+            if (!messageText) continue;
 
-            console.log(`📩 Incoming | ${senderName} (${senderPhone}) | JID: ${remoteJid} | Mode: ${currentOwnerMode} | ${messageText}`);
+            console.log(`📩 Incoming | ${senderName} (${senderPhone}) | Mode: ${currentOwnerMode} | ${messageText}`);
 
             const reply = async (text) => {
                 const sent = await sock.sendMessage(remoteJid, { text }, { quoted: msg });
@@ -324,6 +358,7 @@ async function startDrake() {
                 }
             }
 
+            // Load ONLY this number's top-10 history & learned overall_info
             const record = await getNumberRecord(senderPhone);
             let userHistory = record.chat_history;
             let overallInfo = record.overall_info;
@@ -346,7 +381,10 @@ async function startDrake() {
 
                     try {
                         const bizPrompt = `You are Drake, Himnish's co-founder/AI brain for BOMBEAT. Himnish just set this business rule: "${instruction}". Give a short, direct, honest opinion on it (max 3 lines).`;
-                        const res = await ai.models.generateContent({ model: 'gemini-3.5-flash-lite', contents: bizPrompt });
+                        const res = await withTimeout(
+                            ai.models.generateContent({ model: 'gemini-3.5-flash-lite', contents: bizPrompt }),
+                            8000
+                        );
                         if (res.text) replyText = `${replyText}\n\n${res.text.trim()}`;
                     } catch (e) {
                         console.error("❌ Business opinion error:", e.message);
@@ -355,9 +393,10 @@ async function startDrake() {
                     userHistory.push({ role: 'user', sender: senderName, phone: senderPhone, content: messageText, timestamp: new Date().toISOString() });
                     userHistory.push({ role: 'assistant', sender: 'Drake', phone: senderPhone, content: replyText, timestamp: new Date().toISOString() });
                     userHistory = userHistory.slice(-10);
-                    overallInfo = buildUpdatedOverallInfo(overallInfo, senderName, messageText, replyText, true);
 
+                    overallInfo = await refreshLearnedOverallInfo(senderPhone, overallInfo, senderName, true, messageText, replyText, userHistory, true);
                     await saveNumberRecord(senderPhone, senderName, userHistory, overallInfo);
+
                     await reply(replyText);
                     continue;
                 }
@@ -365,6 +404,7 @@ async function startDrake() {
                 // --- PERSONAL MODE ---
                 const lowerMsg = messageText.toLowerCase();
                 let replyText = "";
+                let forceSummary = false;
 
                 if (lowerMsg.includes('remember') || lowerMsg.includes('note this') || lowerMsg.includes('save this')) {
                     if (!Array.isArray(personalMemory.core_memories)) personalMemory.core_memories = [];
@@ -373,14 +413,15 @@ async function startDrake() {
                         timestamp: new Date().toISOString()
                     });
                     await savePersonalMemory(personalMemory);
-                    replyText = "Saved directly to `drake_memory` and updated your overall info, Boss. 🧠";
+                    forceSummary = true;
+                    replyText = "Saved directly to `drake_memory` and updated your learned info, Boss. 🧠";
                 } else if (isAnalysisRequest(messageText)) {
                     const allRows = await getAllChatsForAnalysis();
                     const clientRows = allRows.filter(r => !String(r.phone_number).includes(OWNER_PHONE));
 
                     const compactDump = clientRows.map(r => {
                         const last10 = (r.chat_history || []).slice(-10).map(m => `  [${m.timestamp}] ${m.role}: ${m.content}`).join('\n');
-                        return `Contact: ${r.sender_name || 'Client'} (${r.phone_number}) | Updated: ${r.updated_at}\nOverall Info: ${r.overall_info || 'N/A'}\nLast 10 Messages:\n${last10}`;
+                        return `Contact: ${r.sender_name || 'Client'} (${r.phone_number}) | Updated: ${r.updated_at}\nLearned Overall Info:\n${r.overall_info || 'N/A'}\nLast 10 Messages:\n${last10}`;
                     }).join('\n\n');
 
                     const currentIST = new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
@@ -392,18 +433,21 @@ Core Memory (drake_memory): ${JSON.stringify(personalMemory)}
 Stored WhatsApp Records (chats_history):
 ${compactDump || "No client records found yet."}
 
-Answer Himnish's question accurately using the overall_info and last-10 message logs above.
-- If asking about a specific person or "what did that guy say", pinpoint that exact contact, their overall_info, and their recent messages.
+Answer Himnish's question accurately using the learned overall_info and last-10 message logs above.
+- If asking about a specific person or "what did that guy say", pinpoint that exact contact, their learned overall_info, and their recent messages.
 - If asking about today/chats/serious leads/weird stuff/who to message, give counts, serious vs weird/time-waster breakdown, and your clear recommendation on who Himnish should hit up personally.
 
 Himnish: ${messageText}
 Drake:`;
 
                     try {
-                        const res = await ai.models.generateContent({
-                            model: 'gemini-3.5-flash-lite',
-                            contents: analysisPrompt
-                        });
+                        const res = await withTimeout(
+                            ai.models.generateContent({
+                                model: 'gemini-3.5-flash-lite',
+                                contents: analysisPrompt
+                            }),
+                            10000
+                        );
                         replyText = (res.text || "").trim() || "Couldn't generate analysis right now.";
                     } catch (e) {
                         console.error("❌ Analysis Gemini error:", e.message);
@@ -414,7 +458,7 @@ Drake:`;
                     const personalPrompt = `
 You are Drake, Himnish's personal AI assistant. Be sharp, natural, real, and opinionated when appropriate.
 Core Memory (drake_memory): ${JSON.stringify(personalMemory)}
-Your Overall Info on Himnish: ${overallInfo || "None yet."}
+Learned Overall Info on Himnish: ${overallInfo || "None yet."}
 
 Last 10 messages with Himnish:
 ${recent10 || "None"}
@@ -423,10 +467,13 @@ Himnish: ${messageText}
 Drake:`;
 
                     try {
-                        const res = await ai.models.generateContent({
-                            model: 'gemini-3.5-flash-lite',
-                            contents: personalPrompt
-                        });
+                        const res = await withTimeout(
+                            ai.models.generateContent({
+                                model: 'gemini-3.5-flash-lite',
+                                contents: personalPrompt
+                            }),
+                            8000
+                        );
                         replyText = (res.text || "").trim() || "Yeah?";
                     } catch (e) {
                         console.error("❌ Personal chat Gemini error:", e.message);
@@ -437,14 +484,15 @@ Drake:`;
                 userHistory.push({ role: 'user', sender: senderName, phone: senderPhone, content: messageText, timestamp: new Date().toISOString() });
                 userHistory.push({ role: 'assistant', sender: 'Drake', phone: senderPhone, content: replyText, timestamp: new Date().toISOString() });
                 userHistory = userHistory.slice(-10);
-                overallInfo = buildUpdatedOverallInfo(overallInfo, senderName, messageText, replyText, true);
 
+                overallInfo = await refreshLearnedOverallInfo(senderPhone, overallInfo, senderName, true, messageText, replyText, userHistory, forceSummary);
                 await saveNumberRecord(senderPhone, senderName, userHistory, overallInfo);
+
                 await reply(replyText);
                 continue;
             }
 
-            // ==================== CLIENT CHAT (USES ONLY THIS NUMBER'S LAST 10 + OVERALL_INFO) ====================
+            // ==================== CLIENT CHAT (USES ONLY THIS NUMBER'S LAST 10 + LEARNED OVERALL_INFO) ====================
             const businessMemory = await getBusinessMemory();
             const personalMemory = await getPersonalMemory();
             const learnedRules = (businessMemory.owner_instructions || []).map(r => `- ${r}`).join('\n');
@@ -454,7 +502,7 @@ Drake:`;
 You are Drake, the AI assistant for BOMBEAT (live music & event booking in Mumbai).
 Personal identity context (drake_memory): ${JSON.stringify(personalMemory)}
 Client Name: ${senderName} (${senderPhone})
-Known Overall Info about this client: ${overallInfo || "New client, no prior summary yet."}
+Learned Overall Info about this client: ${overallInfo || "New client, no prior summary yet."}
 
 Business Instructions & Rules:
 ${learnedRules || "No custom rules set yet."}
@@ -480,10 +528,13 @@ Respond ONLY with raw JSON:
             let ownerAlert = "";
 
             try {
-                const res = await ai.models.generateContent({
-                    model: 'gemini-3.5-flash-lite',
-                    contents: clientPrompt
-                });
+                const res = await withTimeout(
+                    ai.models.generateContent({
+                        model: 'gemini-3.5-flash-lite',
+                        contents: clientPrompt
+                    }),
+                    8000
+                );
 
                 let raw = (res.text || "").trim().replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
                 try {
@@ -499,13 +550,13 @@ Respond ONLY with raw JSON:
                 replyText = "Sorry, had a brief hiccup—let me get right back to you!";
             }
 
-            // Always save chat history + overall_info even if Gemini had a hiccup
             userHistory.push({ role: 'user', sender: senderName, phone: senderPhone, content: messageText, timestamp: new Date().toISOString() });
             userHistory.push({ role: 'assistant', sender: 'Drake', phone: senderPhone, content: replyText, timestamp: new Date().toISOString() });
             userHistory = userHistory.slice(-10);
-            overallInfo = buildUpdatedOverallInfo(overallInfo, senderName, messageText, replyText, false);
 
+            overallInfo = await refreshLearnedOverallInfo(senderPhone, overallInfo, senderName, false, messageText, replyText, userHistory, false);
             await saveNumberRecord(senderPhone, senderName, userHistory, overallInfo);
+
             await reply(replyText);
 
             if (shouldEscalate && ownerAlert) {
